@@ -1,0 +1,6 @@
+.venv/
+.wheels/
+data/
+__pycache__/
+models/*.onnx
+*.log
