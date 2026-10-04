@@ -3,3 +3,5 @@ Pillow>=11.0,<13
 opencv-python-headless>=4.10,<5
 waitress>=3.0,<4
 pillow-heif>=1.0,<2
+onnxruntime==1.23.2
+tokenizers==0.22.1

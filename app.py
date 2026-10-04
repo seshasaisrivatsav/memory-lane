@@ -13,10 +13,15 @@ import sqlite3
 import subprocess
 import threading
 import time
+import math
+from collections import OrderedDict
 from contextlib import contextmanager
 from flask import Flask, request, jsonify, send_file, abort
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
+from jobs import JOBS, LOCKS, STOPS, launch, record_error
+from search_cache import SearchCache
+from intelligence import LocalCLIP, AI_BUDGET, photo_coordinates, video_frames
 
 register_heif_opener()
 BASE = Path(__file__).resolve().parent
@@ -27,8 +32,10 @@ for folder in ('thumbs', 'faces', 'previews'):
 app = Flask(__name__, static_folder=str(BASE / 'static'))
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024
 TOKEN = secrets.token_urlsafe(32)
-LOCK = threading.Lock()
-JOB = dict(running=False, kind='', phase='', discovered=0, processed=0, total=0, errors=[], error_count=0, queued_faces=False, message='Ready')
+LOCK = LOCKS['scan']
+JOB = JOBS['scan']
+CLIP = LocalCLIP(BASE / 'models/clip')
+VISUAL_INDEX = SearchCache(DATA / 'search-vectors.npz')
 PHOTOS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tif', '.tiff', '.heic', '.heif', '.avif'}
 VIDEOS = {'.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi'}
 
@@ -60,6 +67,21 @@ with db() as c:
       person_id INTEGER REFERENCES people(id), crop TEXT, feature BLOB);
     CREATE INDEX IF NOT EXISTS face_person ON faces(person_id,media_id);
     ''')
+    columns = {r[1] for r in c.execute('PRAGMA table_info(media)')}
+    for name, definition in [('latitude','REAL'), ('longitude','REAL'), ('gps_done','INTEGER DEFAULT 0')]:
+        if name not in columns:
+            c.execute(f'ALTER TABLE media ADD COLUMN {name} {definition}')
+    if 'seconds' not in {r[1] for r in c.execute('PRAGMA table_info(faces)')}:
+        c.execute('ALTER TABLE faces ADD COLUMN seconds REAL DEFAULT 0')
+    c.executescript('''CREATE INDEX IF NOT EXISTS media_gps ON media(latitude,longitude);
+      CREATE INDEX IF NOT EXISTS media_faces_pending ON media(face_done,captured DESC);
+      CREATE INDEX IF NOT EXISTS media_gps_pending ON media(gps_done,captured DESC);
+      CREATE TABLE IF NOT EXISTS embeddings(media_id TEXT PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+        vector BLOB, mtime REAL, size INTEGER);
+      CREATE INDEX IF NOT EXISTS embedding_cache_meta ON embeddings(media_id,mtime,size);
+      CREATE TABLE IF NOT EXISTS embedding_errors(media_id TEXT PRIMARY KEY REFERENCES media(id) ON DELETE CASCADE,
+        mtime REAL, size INTEGER);
+    ''')
 
 def folders():
     with db() as c:
@@ -71,9 +93,7 @@ def allowed(path):
     return any(p.is_relative_to(Path(root).resolve()) for root in folders())
 
 def job_error(message):
-    JOB['error_count'] += 1
-    if len(JOB['errors']) < 100:
-        JOB['errors'].append(message)
+    record_error(message)
 
 def ffprobe(path):
     exe = shutil.which('ffprobe')
@@ -119,6 +139,8 @@ def scan_worker():
             continue
         pending = [p.resolve()]
         while pending:
+            if STOPS['scan'].is_set():
+                return
             parent = pending.pop()
             if parent in visited or parent.is_relative_to(resolved_data):
                 continue
@@ -148,6 +170,8 @@ def scan_worker():
     with db() as c:
         existing = {row['id']: row for row in c.execute('SELECT id,mtime,size FROM media')}
     for n, path in enumerate(files.values()):
+        if STOPS['scan'].is_set():
+            return
         JOB.update(processed=n, message=path.name)
         try:
             stat = path.stat()
@@ -177,8 +201,8 @@ def scan_worker():
                     except ValueError:
                         pass
                 if shutil.which('ffmpeg'):
-                    subprocess.run([shutil.which('ffmpeg'), '-v', 'error', '-y', '-i', str(path), '-frames:v', '1',
-                                    '-vf', 'scale=720:720:force_original_aspect_ratio=decrease', str(thumb)],
+                    subprocess.run([shutil.which('ffmpeg'), '-v', 'error', '-y', '-threads', '1', '-i', str(path), '-frames:v', '1',
+                                    '-vf', 'scale=720:720:force_original_aspect_ratio=decrease', '-threads','1', str(thumb)],
                                    capture_output=True, timeout=60, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
             source = 'capture date' if captured else 'file date'
             captured = captured or dt.datetime.fromtimestamp(stat.st_mtime).isoformat()
@@ -186,9 +210,12 @@ def scan_worker():
                 c.execute('''INSERT INTO media(id,path,name,kind,captured,date_source,width,height,duration,mtime,size)
                   VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,
                   kind=excluded.kind,captured=excluded.captured,date_source=excluded.date_source,width=excluded.width,
-                  height=excluded.height,duration=excluded.duration,mtime=excluded.mtime,size=excluded.size,face_done=0''',
+                  height=excluded.height,duration=excluded.duration,mtime=excluded.mtime,size=excluded.size,face_done=0,
+                  gps_done=0,latitude=NULL,longitude=NULL''',
                   (ident, str(path), path.name, kind, captured, source, width, height, duration, stat.st_mtime, stat.st_size))
                 c.execute('DELETE FROM faces WHERE media_id=?', (ident,))
+                c.execute('DELETE FROM embeddings WHERE media_id=?', (ident,))
+                c.execute('DELETE FROM embedding_errors WHERE media_id=?', (ident,))
             (DATA / 'previews' / f'{ident}.jpg').unlink(missing_ok=True)
         except Exception as e:
             job_error(f'{path.name}: {e}')
@@ -199,68 +226,16 @@ def scan_worker():
         c.execute('DELETE FROM people WHERE id NOT IN (SELECT person_id FROM faces)')
     JOB.update(processed=len(files), phase='complete', message='Library is up to date')
 
+from workers import LibraryWorkers
+WORKERS = LibraryWorkers(db, DATA, BASE, photo_data, allowed, ffprobe, CLIP)
+
 def face_worker():
-    import cv2
-    import numpy as np
-    cv2.setNumThreads(2)
-    detector_path, recognizer_path = BASE / 'models/yunet.onnx', BASE / 'models/sface.onnx'
-    if not detector_path.exists() or not recognizer_path.exists():
-        raise ValueError('Face models are missing. Run setup.ps1 first.')
-    detector = cv2.FaceDetectorYN.create(str(detector_path), '', (320, 320), 0.85)
-    recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), '')
-    with db() as c:
-        rows = c.execute("SELECT * FROM media WHERE kind='photo' AND face_done=0").fetchall()
-        groups = [(r['id'], np.frombuffer(r['feature'], dtype=np.float32).copy()) for r in c.execute('SELECT * FROM people')]
-    JOB.update(total=len(rows), phase='grouping')
-    for i, row in enumerate(rows):
-        JOB.update(processed=i, message=row['name'])
-        try:
-            if not allowed(row['path']):
-                continue
-            im, _ = photo_data(row['path'])
-            im.thumbnail((1600, 1600))
-            frame = cv2.cvtColor(np.asarray(im), cv2.COLOR_RGB2BGR)
-            detector.setInputSize((frame.shape[1], frame.shape[0]))
-            _, detected = detector.detect(frame)
-            new_groups = []
-            with db() as c:
-                for j, face in enumerate(detected if detected is not None else []):
-                    feature = recognizer.feature(recognizer.alignCrop(frame, face)).flatten()
-                    feature /= max(float(np.linalg.norm(feature)), 1e-8)
-                    score, pid = max(((float(np.dot(feature, f)), p) for p, f in groups + new_groups), default=(0, None))
-                    if score < 0.45:
-                        pid = c.execute('INSERT INTO people(feature) VALUES(?)', (feature.tobytes(),)).lastrowid
-                        new_groups.append((pid, feature.copy()))
-                    x, y, w, h = face[:4]
-                    crop = f'{row["id"]}-{j}.jpg'
-                    im.crop((max(0, int(x-w*.2)), max(0, int(y-h*.2)), min(im.width, int(x+w*1.2)), min(im.height, int(y+h*1.2)))).resize((180, 180)).save(DATA / 'faces' / crop)
-                    c.execute('INSERT INTO faces(media_id,person_id,crop,feature) VALUES(?,?,?,?)', (row['id'], pid, crop, feature.tobytes()))
-                c.execute('UPDATE media SET face_done=1 WHERE id=?', (row['id'],))
-            groups.extend(new_groups)
-            JOB['processed'] = i + 1
-        except Exception as e:
-            job_error(f'{row["name"]}: {e}')
-    JOB.update(processed=len(rows), phase='complete', message='Face grouping complete')
+    WORKERS.faces()
 
 def start_job(kind, worker):
-    if not LOCK.acquire(blocking=False):
-        return jsonify(error='A library job is already running.'), 409
-    JOB.update(running=True, kind=kind, phase='starting', discovered=0, processed=0, total=0, errors=[], error_count=0, message='Starting…')
-    def run():
-        try:
-            worker()
-        except Exception as e:
-            job_error(str(e))
-            JOB['message'] = 'Completed with errors'
-        finally:
-            JOB['running'] = False
-            LOCK.release()
-            if kind == 'scan' and JOB['queued_faces']:
-                JOB['queued_faces'] = False
-                with app.app_context():
-                    start_job('faces', face_worker)
-    threading.Thread(target=run, daemon=True).start()
-    return jsonify(JOB), 202
+    if not launch(kind, worker):
+        return jsonify(error=f'The {kind} job is already running.'), 409
+    return jsonify(JOBS[kind]), 202
 
 @app.before_request
 def local_only():
@@ -293,13 +268,15 @@ def status():
     with db() as c:
         stats = dict(c.execute("SELECT count(*) count,coalesce(sum(size),0) bytes,coalesce(sum(kind='video'),0) videos FROM media").fetchone())
         stats['people'] = c.execute('SELECT count(*) FROM people').fetchone()[0]
-    return jsonify(token=TOKEN, folders=folders(), job=JOB, stats=stats,
+        stats['search_indexed'] = c.execute('SELECT count(*) FROM embeddings').fetchone()[0]
+        stats['geotagged'] = c.execute('SELECT count(*) FROM media WHERE latitude IS NOT NULL').fetchone()[0]
+    return jsonify(token=TOKEN, folders=folders(), job=JOB, jobs=JOBS, search_ready=CLIP.ready(), stats=stats,
                    faces_ready=all((BASE / 'models' / n).exists() for n in ['yunet.onnx','sface.onnx']), ffmpeg=bool(shutil.which('ffmpeg')))
 
 @app.post('/api/settings')
 def settings():
-    if LOCK.locked():
-        abort(409, 'Wait for the current library job to finish.')
+    if any(lock.locked() for lock in LOCKS.values()):
+        abort(409, 'Pause background jobs before changing folders or merging groups.')
     payload = request.get_json()
     values = payload.get('folders', payload.get('folder_text'))
     if isinstance(values, str):
@@ -369,8 +346,10 @@ def storage():
         ('thumbnails', 'Photo & video thumbnails', DATA/'thumbs', None, True),
         ('previews', 'Full-screen photo previews', DATA/'previews', None, True),
         ('faces', 'Face thumbnails', DATA/'faces', None, True),
+        ('search_cache', 'Visual search cache', DATA, ['search-vectors.npz','search-vectors.tmp'], True),
         ('database', 'Library index, names & face data', DATA, ['library.sqlite','library.sqlite-wal','library.sqlite-shm'], False),
         ('models', 'Offline face models', BASE/'models', ['yunet.onnx','sface.onnx'], False),
+        ('search_models', 'Offline descriptive search models', BASE/'models/clip', None, False),
         ('downloads', 'Cached installation packages', BASE/'.wheels', None, True),
         ('temporary', 'Incomplete model downloads', BASE/'models', ['yunet.download','sface.download'], True),
     ]:
@@ -385,12 +364,24 @@ def scan():
 
 @app.post('/api/faces')
 def faces():
-    if LOCK.locked() and JOB['kind'] == 'scan':
-        JOB['queued_faces'] = True
-        return jsonify(JOB), 202
     return start_job('faces', face_worker)
 
-def media_filters():
+@app.post('/api/places/index')
+def index_places():
+    return start_job('places', WORKERS.places)
+
+@app.post('/api/search/index')
+def index_search():
+    return start_job('search', WORKERS.search)
+
+@app.post('/api/jobs/<kind>/pause')
+def pause_job(kind):
+    if kind not in STOPS:
+        abort(404)
+    STOPS[kind].set()
+    return jsonify(ok=True)
+
+def media_filters(include_query=True):
     clauses, args = ['1=1'], []
     if request.args.get('kind') in ('photo', 'video'):
         clauses.append('kind=?'); args.append(request.args['kind'])
@@ -398,7 +389,7 @@ def media_filters():
         clauses.append('favorite=1')
     if request.args.get('person'):
         clauses.append('id IN (SELECT media_id FROM faces WHERE person_id=?)'); args.append(request.args['person'])
-    if request.args.get('q'):
+    if include_query and request.args.get('q'):
         clauses.append('(name LIKE ? OR captured LIKE ?)'); args.extend(['%'+request.args['q']+'%']*2)
     return clauses, args
 
@@ -413,24 +404,126 @@ def timeline():
 @app.get('/api/media')
 def media_list():
     clauses, args = media_filters()
-    if request.args.get('from_month'):
+    base_clauses, base_args = list(clauses), list(args)
+    newer = request.args.get('newer')
+    if request.args.get('from_month') and not newer:
         try:
             month = dt.datetime.strptime(request.args['from_month'], '%Y-%m')
             next_month = month.replace(year=month.year+1, month=1) if month.month == 12 else month.replace(month=month.month+1)
         except ValueError:
             abort(400, 'Invalid month')
         clauses.append('captured < ?'); args.append(next_month.isoformat())
-    if request.args.get('cursor'):
+    if request.args.get('cursor') or newer:
         try:
-            date, ident = json.loads(request.args['cursor'])
+            date, ident = json.loads(newer or request.args['cursor'])
         except Exception:
             abort(400, 'Invalid page cursor')
-        clauses.append('(captured < ? OR (captured = ? AND id < ?))'); args.extend([date, date, ident])
+        op = '>' if newer else '<'
+        clauses.append(f'(captured {op} ? OR (captured = ? AND id {op} ?))'); args.extend([date, date, ident])
     with db() as c:
-        rows = [dict(r) for r in c.execute('SELECT * FROM media WHERE '+' AND '.join(clauses)+' ORDER BY captured DESC,id DESC LIMIT 61', args)]
-    more = len(rows) > 60
-    rows = rows[:60]
-    return jsonify(items=rows, next=json.dumps([rows[-1]['captured'], rows[-1]['id']]) if more else None)
+        order = 'ASC' if newer else 'DESC'
+        rows = [dict(r) for r in c.execute('SELECT * FROM media WHERE '+' AND '.join(clauses)+f' ORDER BY captured {order},id {order} LIMIT 61', args)]
+        more = len(rows) > 60
+        rows = rows[:60]
+        if newer:
+            rows.reverse()
+        previous = None
+        if rows:
+            first = rows[0]
+            has_previous = c.execute('SELECT 1 FROM media WHERE '+' AND '.join(base_clauses)+
+                ' AND (captured > ? OR (captured = ? AND id > ?)) LIMIT 1', base_args+[first['captured'],first['captured'],first['id']]).fetchone()
+            if has_previous:
+                previous = json.dumps([first['captured'],first['id']])
+        if request.args.get('person'):
+            for row in rows:
+                row['face_time'] = c.execute('SELECT min(seconds) FROM faces WHERE media_id=? AND person_id=?',
+                    (row['id'],request.args['person'])).fetchone()[0] or 0
+    return jsonify(items=rows, next=json.dumps([rows[-1]['captured'], rows[-1]['id']]) if rows and more else None, previous=previous)
+
+SEARCH_CACHE = OrderedDict()
+SEARCH_LOCK = threading.Lock()
+
+@app.get('/api/search')
+def semantic_search():
+    import numpy as np
+    query = request.args.get('q','').strip()
+    if not query or len(query)>500:
+        abort(400,'Describe what you want to find in 500 characters or less.')
+    if not CLIP.ready():
+        abort(409,'Install the local search models with setup.ps1 first.')
+    clauses,args=media_filters(include_query=False)
+    key=(query,tuple(clauses),tuple(args))
+    try:
+        offset=int(request.args.get('cursor','0'))
+        if not 0<=offset<=300:raise ValueError()
+    except ValueError:
+        abort(400,'Invalid search cursor')
+    with SEARCH_LOCK:
+        cached=SEARCH_CACHE.get(key)
+        if not cached or time.monotonic()-cached[0]>90:
+            query_vector=CLIP.text_vector(query)
+            with db() as c:
+                best=VISUAL_INDEX.rank(c,query_vector,clauses,args)
+            cached=(time.monotonic(),best)
+            SEARCH_CACHE[key]=cached
+            while len(SEARCH_CACHE)>8:SEARCH_CACHE.popitem(last=False)
+    results=[]
+    with db() as c:
+        for ident,score in cached[1][offset:offset+60]:
+            row=c.execute('SELECT * FROM media WHERE id=?',(ident,)).fetchone()
+            if row:
+                item=dict(row);item['similarity']=score;results.append(item)
+    return jsonify(items=results,next=str(offset+60) if len(cached[1])>offset+60 else None,previous=None,
+                   semantic=True,ranked=len(cached[1]))
+
+def geographic_bounds():
+    try:
+        south=float(request.args.get('south',-90))
+        north=float(request.args.get('north',90))
+        west=float(request.args.get('west',-180))
+        east=float(request.args.get('east',180))
+        if not all(math.isfinite(v) for v in [south,north,west,east]) or south>north or west>east:
+            raise ValueError()
+        return max(-90,south),min(90,north),max(-180,west),min(180,east)
+    except ValueError:
+        abort(400,'Invalid map bounds')
+
+@app.get('/api/places')
+def places_map():
+    south,north,west,east=geographic_bounds()
+    try:
+        zoom=max(1,min(18,int(request.args.get('zoom',2))))
+    except ValueError:
+        abort(400,'Invalid zoom')
+    cell=360/(2**zoom*4)
+    with db() as c:
+        summary=dict(c.execute('''SELECT count(*) count,min(latitude) south,max(latitude) north,
+             min(longitude) west,max(longitude) east FROM media WHERE latitude IS NOT NULL''').fetchone())
+        rows=c.execute('''SELECT cast((latitude+90)/? AS INTEGER) y,cast((longitude+180)/? AS INTEGER) x,
+             avg(latitude) latitude,avg(longitude) longitude,count(*) count,min(id) cover
+             FROM media WHERE latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?
+             GROUP BY y,x ORDER BY count DESC LIMIT 1501''',(cell,cell,south,north,west,east)).fetchall()
+    groups=[]
+    for row in rows[:1500]:
+        item=dict(row)
+        item.update(south=item.pop('y')*cell-90,west=item.pop('x')*cell-180)
+        item.update(north=item['south']+cell,east=item['west']+cell)
+        groups.append(item)
+    return jsonify(summary=summary,groups=groups,truncated=len(rows)>1500)
+
+@app.get('/api/places/media')
+def place_media():
+    south,north,west,east=geographic_bounds()
+    clauses=['latitude>=?','latitude<?','longitude>=?','longitude<?']
+    args=[south,north,west,east]
+    if request.args.get('cursor'):
+        try:date,ident=json.loads(request.args['cursor'])
+        except Exception:abort(400,'Invalid cursor')
+        clauses.append('(captured < ? OR (captured=? AND id<?))');args.extend([date,date,ident])
+    with db() as c:
+        rows=[dict(r) for r in c.execute('SELECT * FROM media WHERE '+' AND '.join(clauses)+' ORDER BY captured DESC,id DESC LIMIT 61',args)]
+    more=len(rows)>60;rows=rows[:60]
+    return jsonify(items=rows,next=json.dumps([rows[-1]['captured'],rows[-1]['id']]) if more else None)
 
 def get_media(ident):
     with db() as c:
@@ -483,11 +576,18 @@ def memories():
                 stories.append(dict(title=f'{ago} year'+('s' if ago != 1 else '')+' ago', subtitle='Around this time', items=rows))
     return jsonify(stories)
 
+@app.get('/api/people/suggestions')
+def people_suggestions():
+    from face_groups import suggestions
+    with db() as c:
+        return jsonify(suggestions(c))
+
 @app.get('/api/people')
 def people():
     with db() as c:
-        rows = [dict(r) for r in c.execute('''SELECT p.id,p.name,count(DISTINCT f.media_id) count,min(f.crop) crop
-            FROM people p JOIN faces f ON f.person_id=p.id GROUP BY p.id ORDER BY count DESC''')]
+        rows = [dict(r) for r in c.execute('''SELECT p.id,p.name,count(DISTINCT f.media_id) count,min(f.crop) crop,
+            count(DISTINCT CASE WHEN m.kind='video' THEN m.id END) videos
+            FROM people p JOIN faces f ON f.person_id=p.id JOIN media m ON m.id=f.media_id GROUP BY p.id ORDER BY count DESC''')]
     return jsonify(rows)
 
 @app.get('/face/<name>')
@@ -510,14 +610,14 @@ def name_person(ident):
 
 @app.post('/api/people/<int:ident>/merge')
 def merge_person(ident):
-    if LOCK.locked():
-        abort(409, 'Wait for the current job to finish.')
     target = request.get_json().get('target')
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
         if target == ident or not c.execute('SELECT id FROM people WHERE id=?', (target,)).fetchone():
             abort(400, 'Choose another person.')
         c.execute('UPDATE faces SET person_id=? WHERE person_id=?', (target, ident))
         c.execute('DELETE FROM people WHERE id=?', (ident,))
+        c.execute("INSERT INTO settings(key,value) VALUES('face_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+1")
     return jsonify(ok=True)
 
 if __name__ == '__main__':
